@@ -1,8 +1,9 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Linq;
+using System.Security.Permissions;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -24,6 +25,7 @@ namespace StackParser
         static string s_outputFile;
         static string s_symbolServerPath;
         static bool s_keepModules = false;
+        static bool s_interactive = false;
         static Dictionary<string, IDiaSession> s_pdbMap = new Dictionary<string, IDiaSession>(StringComparer.OrdinalIgnoreCase);
         static Dictionary<string, string> s_moduleToPeFileMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         static List<string> s_pdbFileList = new List<string>();
@@ -153,12 +155,78 @@ namespace StackParser
                 return -1;
             return 1;
         }
+
+        public static IEnumerable<String> ParseText(String line, Char delimiter, Char textQualifier)
+        {
+
+            if (line == null)
+                yield break;
+
+            else
+            {
+                Char prevChar = '\0';
+                Char nextChar = '\0';
+                Char currentChar = '\0';
+
+                Boolean inString = false;
+
+                StringBuilder token = new StringBuilder();
+
+                for (int i = 0; i < line.Length; i++)
+                {
+                    currentChar = line[i];
+
+                    if (i > 0)
+                        prevChar = line[i - 1];
+                    else
+                        prevChar = '\0';
+
+                    if (i + 1 < line.Length)
+                        nextChar = line[i + 1];
+                    else
+                        nextChar = '\0';
+
+                    if (currentChar == textQualifier && (prevChar == '\0' || prevChar == delimiter) && !inString)
+                    {
+                        inString = true;
+                        continue;
+                    }
+
+                    if (currentChar == textQualifier && (nextChar == '\0' || nextChar == delimiter) && inString)
+                    {
+                        inString = false;
+                        continue;
+                    }
+
+                    if (currentChar == delimiter && !inString)
+                    {
+                        yield return token.ToString();
+                        token = token.Remove(0, token.Length);
+                        continue;
+                    }
+
+                    token = token.Append(currentChar);
+
+                }
+
+                yield return token.ToString();
+
+            }
+        }
+
         static void Main(string[] args)
         {
             if (args.Length == 0)
             {
                 PrintUsage();
-                return;
+                Console.WriteLine();
+                Console.WriteLine("Enter arguments: ");
+                s_interactive = true;
+                args = ParseText(Console.ReadLine(), ' ', '"').ToArray();
+                if (args.Length == 0)
+                {
+                    return;
+                }
             }
 
 
@@ -214,8 +282,10 @@ namespace StackParser
             System.IO.StreamWriter sw = null;
             System.IO.TextReader tr;
             System.IO.TextWriter tw = null;
+            bool tsvMode = false;
             if (!String.IsNullOrEmpty(s_inputFile) && File.Exists(s_inputFile))
             {
+                tsvMode = Path.GetExtension(s_inputFile) == ".tsv";
                 tr = sr = new System.IO.StreamReader(s_inputFile);
             }
             else
@@ -282,28 +352,61 @@ namespace StackParser
                     s_symbolServerPath = "srv*" + s_localSymbolRoot + "*" + internalSymbolServer;
                 }
             }
-
+            int lineCount = -1;
             while((line = tr.ReadLine()) != null)
             {
                 const string separator = "!<BaseAddress>+0x";
-                string[] frags = line.Split(new string[] { separator }, StringSplitOptions.RemoveEmptyEntries);
-                if (frags.Length == 2)
+                string moduleStr = "";
+                string moduleName = "";
+                string rvaStr = "";
+                string rva = "";
+                string prefix = "at ";
+                string suffix = "";
+                string methodName = "";
+                lineCount++;
+                if (tsvMode)
                 {
-                    string moduleStr = frags[0];
-                    int idx = moduleStr.LastIndexOf(' ');
-                    if (idx < 0) idx = -1;
-                    string moduleName = moduleStr.Substring(idx + 1);
-                    string prefix = moduleStr.Substring(0, idx + 1);
+                    if (lineCount == 0) continue;
+                    string[] frags = line.Split('\t');
+                    if (frags.Length >= 4)
+                    {
+                        moduleStr = frags[1];
+                        moduleName = moduleStr.Replace(".dll", "").Replace(".exe", "");
+                        rvaStr = frags[3];
+                        rva = rvaStr.Replace("0x", "");
+                        if (frags[2] != "null")
+                        {
+                            methodName = frags[2];
+                        }
+                    }
+                }
+                else
+                {
+                    string[] frags = line.Split(new string[] { separator }, StringSplitOptions.RemoveEmptyEntries);
+                    if (frags.Length == 2)
+                    {
+                        moduleStr = frags[0];
+                        int idx = moduleStr.LastIndexOf(' ');
+                        if (idx < 0) idx = -1;
+                        moduleName = moduleStr.Substring(idx + 1);
+                        prefix = moduleStr.Substring(0, idx + 1);
 
-                    string rvaStr = frags[1];
-                    idx = rvaStr.IndexOf(' ');
-                    if (idx < 0) idx = rvaStr.Length;
-                    string rva = rvaStr.Substring(0, idx);
-                    string suffix = rvaStr.Substring(idx);
+                        rvaStr = frags[1];
+                        idx = rvaStr.IndexOf(' ');
+                        if (idx < 0) idx = rvaStr.Length;
+                        rva = rvaStr.Substring(0, idx);
+                        suffix = rvaStr.Substring(idx);
+                    }
+                    else
+                    {
+                        tw.WriteLine(line);
+                    }
+                }
 
+                if (!String.IsNullOrEmpty(moduleName) )
+                {
                     uint rvaNum;
                     IDiaSession pdbSession = null;
-                    string methodName;
                     if (!s_pdbMap.TryGetValue(moduleName, out pdbSession))
                     {
                         string peFileName;
@@ -328,12 +431,23 @@ namespace StackParser
                         }
                     }
 
-                    if (pdbSession == null ||
-                        (rvaNum = HexToUint(rva)) == 0 ||
-                        ((methodName = DiaHelper.GetMethodName(pdbSession, rvaNum)) == null))
+                    string tmpMethodName = null;
+
+                    if (pdbSession == null || (rvaNum = HexToUint(rva)) == 0 || ((tmpMethodName = DiaHelper.GetMethodName(pdbSession, rvaNum)) == null))
                     {
-                        tw.WriteLine("{0}{1}{2}", moduleStr, separator, rvaStr);
+                        if (!String.IsNullOrEmpty(methodName))
+                        {
+                            tw.WriteLine("{0}{1}!{2} {3}",prefix,moduleStr, methodName, rvaStr);
+                        }
+                        else
+                        {
+                            tw.WriteLine("{0}{1}{2}", moduleStr, separator, rvaStr);
+                        }
                         continue;
+                    }
+                    if (!String.IsNullOrEmpty(tmpMethodName))
+                    {
+                        methodName = tmpMethodName;
                     }
 
                     tw.WriteLine("{0}{1}!{2}{3}", prefix, moduleName, methodName, suffix);
@@ -342,6 +456,8 @@ namespace StackParser
                 {
                     tw.WriteLine(line);
                 }
+               
+
             }
 
             // clean up
@@ -405,6 +521,11 @@ namespace StackParser
             if (sw != null)
             {
                 sw.Close();
+            }
+            if (s_interactive)
+            {
+                Console.WriteLine("Press a key to exit.");
+                Console.ReadLine();
             }
         }
 
